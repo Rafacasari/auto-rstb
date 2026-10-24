@@ -1,4 +1,4 @@
-//! Auto RSTB: at launch, rebuilds Animal Crossing: New Horizons 3.0.3's resource size table
+//! Auto RSTB: at launch, rebuilds Animal Crossing: New Horizons' resource size table
 //! for the modded files (see `mods`), starting from the game's own table. The table is written
 //! to the config folder, and the game's reads of its table are sent there (see `redirect`), so
 //! a changed table works in the same launch.
@@ -19,13 +19,12 @@ use cache::Cache;
 use mods::{Copies, Folder};
 use platform::RomMount;
 
-const GAME_VERSION: &str = "3.0.3";
+/// The game version the sizes were traced on.
+const TRACED_VERSION: &str = "3.0.3";
 
 const CONFIG: &str = "sd:/config/auto-rstb";
 /// The table the game reads instead of its own.
 const MODDED_TABLE: &str = "sd:/config/auto-rstb/ResourceSizeTable.srsizetable";
-/// A copy of the game's own table, read while no table in a romfs folder hides it.
-const VANILLA_TABLE: &str = "sd:/config/auto-rstb/vanilla.srsizetable";
 const CACHE: &str = "sd:/config/auto-rstb/cache.tsv";
 const LOG: &str = "sd:/config/auto-rstb/log.txt";
 const TEMPORARY: &str = "sd:/config/auto-rstb/table.tmp";
@@ -64,14 +63,7 @@ pub fn main() {
     // Sets up std's output before memory is borrowed, as it lives for the whole game
     println!("[auto-rstb] Updating the resource size table.");
     let version = skyline::nn::oe::get_display_version();
-    if version != GAME_VERSION {
-        // The heaps memory is borrowed from, and the table's contents, are only known for this version
-        let mut log = Log::default();
-        log.line(format!("Game version {version} is not {GAME_VERSION}; the game reads its own table."));
-        log.save();
-        return;
-    }
-    if arena::with_borrowed_memory(update) {
+    if arena::with_borrowed_memory(|loan| update(loan, &version)) {
         skyline::nn::oe::exit_application();
     }
     // A table from an earlier launch still beats the game's own when this update failed
@@ -81,13 +73,17 @@ pub fn main() {
 }
 
 /// Updates the table, returning whether the game must close.
-fn update(loan: &arena::Loan) -> bool {
+fn update(loan: &arena::Loan, version: &str) -> bool {
     let mut log = Log::default();
+    log.line(format!("Game version {version}."));
+    if version != TRACED_VERSION {
+        log.line(format!("The sizes were traced on {TRACED_VERSION}; file types this version sizes differently may be off."));
+    }
     log.line(loan.report.trim_end());
     let outcome = match loan.size {
         // malloc's 32 MiB, which the game shares, is too little for model and shader data
         0 => Err("No game heap could lend enough memory to size files.".to_string()),
-        _ => run(&mut log),
+        _ => run(&mut log, version),
     };
     match outcome {
         Ok(Outcome::Ready) => {
@@ -117,16 +113,16 @@ Modded files may crash the game. Details are in {LOG}."
     }
 }
 
-fn run(log: &mut Log) -> Result<Outcome, String> {
+fn run(log: &mut Log, version: &str) -> Result<Outcome, String> {
     platform::create_dirs(CONFIG)?;
     let folders = mods::folders()?;
     let rom = RomMount::new(ROM_MOUNT).map_err(|error| log.line(format!("{error} Vanilla files are unavailable."))).ok();
-    let Some(vanilla) = vanilla_table(log, &folders, rom.as_ref())? else {
+    let Some(vanilla) = vanilla_table(log, version, &folders, rom.as_ref())? else {
         return Ok(Outcome::Restart("A resource size table in a romfs folder hid the game's own, so it was moved to the config folder. The game's table can be read from the next launch."));
     };
 
     let mut table = vanilla;
-    size_files(log, &mut table, &folders, rom.as_ref())?;
+    size_files(log, version, &mut table, &folders, rom.as_ref())?;
     drop(rom);
 
     if platform::read_optional(MODDED_TABLE)?.is_some_and(|bytes| parse_table(&bytes).is_ok_and(|current| current == table)) {
@@ -139,13 +135,14 @@ fn run(log: &mut Log) -> Result<Outcome, String> {
     Ok(Outcome::Ready)
 }
 
-/// The game's own table: the saved copy, else the romfs's table, which is the game's only
-/// while no romfs folder has a table. Tables found there are moved away, returning `None`:
-/// the game's romfs keeps showing them for this launch.
-fn vanilla_table(log: &mut Log, folders: &[Folder], rom: Option<&RomMount>) -> Result<Option<Table>, String> {
+/// The game's own table: the copy saved for this game version, else the romfs's table, which
+/// is the game's only while no romfs folder has a table. Tables found there are moved away,
+/// returning `None`: the game's romfs keeps showing them for this launch.
+fn vanilla_table(log: &mut Log, version: &str, folders: &[Folder], rom: Option<&RomMount>) -> Result<Option<Table>, String> {
+    let saved = format!("{CONFIG}/vanilla-{version}.srsizetable");
     let modded: Vec<_> =
         folders.iter().map(|folder| (folder, format!("{}/{TABLE}", folder.root))).filter(|(_, path)| platform::file_exists(path)).collect();
-    if let Some(bytes) = platform::read_optional(VANILLA_TABLE)? {
+    if let Some(bytes) = platform::read_optional(&saved)? {
         match parse_table(&bytes) {
             Ok(table) => {
                 for (_, path) in &modded {
@@ -167,7 +164,7 @@ fn vanilla_table(log: &mut Log, folders: &[Folder], rom: Option<&RomMount>) -> R
     let rom = rom.ok_or("The game's resource size table cannot be read without the romfs.")?;
     let bytes = platform::read(&rom.path(TABLE))?;
     let table = parse_table(&bytes)?;
-    platform::write(VANILLA_TABLE, &bytes)?;
+    platform::write(&saved, &bytes)?;
     Ok(Some(table))
 }
 
@@ -198,7 +195,7 @@ fn source(log: &mut Log, rom: Option<&RomMount>, relative: &str, copies: &Copies
 }
 
 /// Sizes every table resource in the romfs folders into `table`.
-fn size_files(log: &mut Log, table: &mut Table, folders: &[Folder], rom: Option<&RomMount>) -> Result<(), String> {
+fn size_files(log: &mut Log, version: &str, table: &mut Table, folders: &[Folder], rom: Option<&RomMount>) -> Result<(), String> {
     let (files, counts) = mods::files(folders)?;
     let listed: Vec<_> = folders.iter().zip(&counts).map(|(folder, count)| format!("{} ({count})", folder.root)).collect();
     log.line(format!("Modded files: {}.", listed.join(", ")));
@@ -213,7 +210,7 @@ fn size_files(log: &mut Log, table: &mut Table, folders: &[Folder], rom: Option<
         Some(copies) => format!("sd shader {} {}", mods::length(copies), mods::stamp(copies)?),
         None => "game shader".to_string(),
     };
-    let mut cache = Cache::load(CACHE, format!("auto-rstb {} rstb {} {shader}", env!("CARGO_PKG_VERSION"), rstb::VERSION));
+    let mut cache = Cache::load(CACHE, format!("auto-rstb {} rstb {} game {version} {shader}", env!("CARGO_PKG_VERSION"), rstb::VERSION));
     let mut sizer = Sizer::new(shader_path);
     let (mut sized, mut cached, mut changed, mut added, mut removed) = (0, 0, 0, 0, 0);
     for (relative, copies) in &files {
